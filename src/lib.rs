@@ -1,26 +1,31 @@
 
-//! # uring-fs
-//! Features:
+//! # Features
 //! - Truly asynchronous file operations using io-uring.
 //! - Supports any async runtime.
 //! - Linux only.
 //! - Only depends on `io_uring` and `libc`.
+//!
 //! # Example
 //! ```no_run
 //! # async {
 //! let io = uring_fs::IoUring::new().unwrap(); // implements Send + Sync
-//! let file: std::fs::File = io.open("foo.txt", uring_fs::OpenOptions::READ).await.unwrap();
-//! //        ^^^^^^^^^^^^^ you could also open the file using the standard library
+//! let file = unsafe { io.open("foo.txt", uring_fs::OpenOptions::READ) }.await.unwrap();
+//! //         ^^^^^^ see IoUring docs for why this is unsafe
 //! let mut buffer = [0; 1024];
 //! let bytes_read = unsafe { io.read(&file, &mut buffer) }.await.unwrap(); // awaiting returns io::Result
 //! # };
 //! ```
 //! See [`IoUring`] documentation for more important infos and examples.
+//!
 //! # Notes
 //! This library will spawn a reaper thread that waits for io-uring completions and notifies the waker.
 //! This is nesessary for compatibility across runtimes.
+//!
+//! Please also note that the code for this library is not tested very well and might
+//! contain some subtle undefined behaviour. The source code isn't very big and you can always
+//! verify and fork it yourself.
 
-use std::{fmt, error, io, thread, sync::{Arc, Mutex, atomic}, fs, os::{fd::{AsRawFd, FromRawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path};
+use std::{fmt, error, io, thread, sync::{Arc, Mutex, atomic}, os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path};
 use private_io_state::IoState;
 
 mod private_io_state {
@@ -148,6 +153,9 @@ impl CompletionKind {
     }
 }
 
+/// Error indicating that the submission queue is full.
+///
+/// Should be checked using [`is_queue_full`].
 pub struct QueueFull;
 impl fmt::Debug for QueueFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "the io-uring submission queue is full") }
@@ -157,9 +165,10 @@ impl fmt::Display for QueueFull {
 }
 impl error::Error for QueueFull {}
 
-/// In what mode to open a file. It is not possible use [`OpenOptions`](std::fs::OpenOptions) because it
-/// doesn't support retreiving the raw `flags` that would be passed to a call to `openat`. (Please
-/// tell me if it does and I just didn't see it!)
+/// In what mode to open a file.
+///
+/// It is not possible use [`std::fs::OpenOptions`] because it doesn't support retreiving the raw `flags`
+/// that would be passed to a call to `openat`. (Please tell me if it does and I just didn't see it!)
 /// # Example
 /// ```no_run
 /// # use uring_fs::OpenOptions;
@@ -184,9 +193,29 @@ impl OpenOptions {
     pub const APPEND: Self = Self { flags: libc::O_APPEND };
 }
 
-/// The main `io-uring` context. Used to perform I/O operations and obtain their completions.
+/// Represents an open file.
 ///
-/// A submission queue size (sq depth) can be specified using the [`with_size`](IoUring::with_size) method, or you can
+/// You can convert the returned [`File`] to a [`std::fs::File`] by converting the file to raw
+/// handle and back.
+pub struct File {
+    fd: RawFd
+}
+
+impl FromRawFd for File {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self { fd }
+    }
+}
+
+impl AsRawFd for File {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+/// The main io-uring context. Used to perform I/O operations and obtain their completions.
+///
+/// A submission queue size (sq depth) can be specified using the [`new_with_size`](IoUring::new_with_size) method, or you can
 /// use a default value of `8` with the [`new`](IoUring::new).
 ///
 /// It should be pretty difficult to overflow the submission queue, since every request is immediatly
@@ -208,7 +237,7 @@ impl OpenOptions {
 /// # async {
 /// use uring_fs::{IoUring, OpenOptions};
 /// let io = IoUring::new().unwrap();
-/// let file = io.open("foo.txt", OpenOptions::READ).await.unwrap();
+/// let file = unsafe { io.open("foo.txt", OpenOptions::READ) }.await.unwrap();
 /// let mut buf = [0; 1024];
 /// let bytes_read = unsafe { io.read(&file, &mut buf) }.await.unwrap();
 /// # };
@@ -218,8 +247,8 @@ impl OpenOptions {
 /// ```no_run
 /// # async {
 /// use uring_fs::{IoUring, OpenOptions, is_queue_full};
-/// let io = IoUring::with_size(10).unwrap(); // only enough space for 10 concurrent operations
-/// let file = io.open("foo.txt", OpenOptions::READ).await.unwrap();
+/// let io = IoUring::new_with_size(10).unwrap(); // only enough space for 10 concurrent operations
+/// let file = unsafe { io.open("foo.txt", OpenOptions::READ) }.await.unwrap();
 /// for _ in 0..20 { // 20 iterations
 ///     let mut buf = [0; 1024];
 ///     let result = unsafe { io.read(&file, &mut buf) }.await; // on the 11th iteration this might start return errors
@@ -241,13 +270,13 @@ impl IoUring {
     /// Starts a new `io_uring` system.
     ///
     /// Uses a default submission queue size of `8`.
-    /// For changing this size see [`with_size`](IoUring::with_size).
+    /// For changing this size see [`new_with_size`](IoUring::new_with_size).
     pub fn new() -> io::Result<Self> {
-        Self::with_size(8)
+        Self::new_with_size(8)
     }
 
     /// Starts a new `io_uring` system with a specified submission queue size.
-    pub fn with_size(size: u32) -> io::Result<Self> {
+    pub fn new_with_size(size: u32) -> io::Result<Self> {
 
         let shared = Arc::new(IoState::new(io_uring::IoUring::new(size)?));
         let shared_clone = Arc::clone(&shared);
@@ -331,13 +360,16 @@ impl IoUring {
 
     }
 
-    /// Opens a file. Returns an [`std::fs::File`], you don't have to use this function to open
-    /// files.
+    /// Opens a file. Returns a [`File`].
     ///
     /// Opening files can sometimes block if they need to be created, emptied or more. This
     /// function allows doing this in an asynchronous manner.
-    /// For more notes see [`OpenOptions`]..
-    pub fn open<'b, P: AsRef<path::Path>>(&self, path: P, options: OpenOptions) -> Completion<'b, fs::File> {
+    /// For more notes see [`OpenOptions`].
+    ///
+    /// # Safety
+    /// You must ensure that the returned `Completion` is never dropped without it's destructor
+    /// running.
+    pub unsafe fn open<'b, P: AsRef<path::Path>>(&self, path: P, options: OpenOptions) -> Completion<'b, File> {
         const CWD: io_uring::types::Fd = io_uring::types::Fd(libc::AT_FDCWD); // represents the current working directory
         let op = io_uring::opcode::OpenAt::new(
             CWD,
@@ -345,7 +377,7 @@ impl IoUring {
         ).flags(options.flags).build();
         self.submit(op, CompletionKind::regular(), |fd| {
             assert!(fd > 0);
-            unsafe { fs::File::from_raw_fd(fd) }
+            unsafe { File::from_raw_fd(fd) }
         })
     }
 
@@ -354,7 +386,7 @@ impl IoUring {
     /// # Safety
     /// You must ensure that the returned `Completion` is never dropped without it's destructor
     /// running.
-    pub unsafe fn read<'b>(&self, file: &fs::File, buf: &'b mut [u8]) -> Completion<'b, usize> {
+    pub unsafe fn read<'b>(&self, file: &File, buf: &'b mut [u8]) -> Completion<'b, usize> {
         let op = io_uring::opcode::Read::new(
             io_uring::types::Fd(file.as_raw_fd()),
             buf.as_mut_ptr(),
@@ -365,10 +397,12 @@ impl IoUring {
 
     /// Writes data to a file. Returns how many bytes were written.
     ///
+    /// Note that seeking using the [`Seek`](std::io::Seek) trait doesn't work.
+    ///
     /// # Safety
     /// You must ensure that the returned `Completion` is never dropped without it's destructor
     /// running.
-    pub unsafe fn write<'b>(&self, file: &fs::File, buf: &'b [u8]) -> Completion<'b, usize> {
+    pub unsafe fn write<'b>(&self, file: &File, buf: &'b [u8]) -> Completion<'b, usize> {
         let op = io_uring::opcode::Write::new(
             io_uring::types::Fd(file.as_raw_fd()),
             buf.as_ptr(),
@@ -419,13 +453,19 @@ mod tests {
         extreme::run(async {
 
             let io = crate::IoUring::new().unwrap();
-            let file = io.open("src/foo.txt", crate::OpenOptions::READ).await.unwrap();
+            let file = unsafe { io.open("src/foo.txt", crate::OpenOptions::RDWR) }.await.unwrap();
 
             let mut buf = [0; 1024];
             let bytes_read = unsafe { io.read(&file, &mut buf) }.await.unwrap();
             println!("Bytes read: {}", bytes_read);
-            let msg = String::from_utf8_lossy(&buf);
-            println!("{}", msg);
+
+            let bytes_written = unsafe { io.write(&file, &buf[..bytes_read]) }.await.unwrap();
+            println!("Bytes written: {}", bytes_written);
+
+            let bytes_written = unsafe { io.write(&file, &buf[..bytes_read]) }.await.unwrap();
+            println!("Bytes written: {}", bytes_written);
+
+            assert!(bytes_read == bytes_written && bytes_read > 0);
 
         });
         

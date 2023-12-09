@@ -3,6 +3,7 @@ name = "uring-fs"
 version = "0.1.0"
 edition = "2021"
 description = "Truly asynchronous file operations using io-uring. Supports any async runtime. Linux only."
+license = "MIT"
 
 [dependencies]
 io-uring = "0.6.*"
