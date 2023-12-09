@@ -5,7 +5,8 @@ edition = "2021"
 description = "Truly asynchronous file operations using io-uring. Supports any async runtime. Linux only."
 
 [dependencies]
-io-uring = "0.6.2"
+io-uring = "0.6.*"
+libc = "0.2.*"
 
 [dev-dependencies]
 extreme = "*"

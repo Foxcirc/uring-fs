@@ -3,7 +3,7 @@
 //! This library will spawn one thread that waits for io-uring completions and notifies the waker.
 //! This is nesessary to remain compatible with every runtime.
 
-use std::{fmt, error, io, thread, sync::{Arc, Mutex, atomic}, fs, os::fd::AsRawFd, task, future, pin::Pin, marker::PhantomData, time};
+use std::{fmt, error, io, thread, sync::{Arc, Mutex, atomic}, fs, os::{fd::{AsRawFd, FromRawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path};
 use private_io_state::IoState;
 
 mod private_io_state {
@@ -47,13 +47,14 @@ mod private_io_state {
 
 }
 
-pub struct Completion<'a> {
+pub struct Completion<'a, T> {
     state: Arc<Mutex<CompletionState>>,
+    func: fn(i32) -> T,
     marker: PhantomData<&'a ()>
 }
 
-impl<'a> future::Future for Completion<'a> {
-    type Output = io::Result<usize>;
+impl<'a, T> future::Future for Completion<'a, T> {
+    type Output = io::Result<T>;
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
         let mut guard = self.state.lock().expect("data lock poisoned");
         if let Some(result) = guard.result {
@@ -61,7 +62,7 @@ impl<'a> future::Future for Completion<'a> {
                 let err = io::Error::from_raw_os_error(-result);
                 task::Poll::Ready(Err(err))
             } else {
-                let val = result as usize;
+                let val = (self.func)(result);
                 task::Poll::Ready(Ok(val))
             }
         } else {
@@ -85,6 +86,23 @@ impl fmt::Display for QueueFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "the io-uring submission queue is full") }
 }
 impl error::Error for QueueFull {}
+
+pub struct OpenOptions {
+    pub flags: i32
+}
+
+impl OpenOptions {
+    /// read only
+    pub const READ: Self = Self { flags: libc::O_RDONLY };
+    /// write only
+    pub const WRITE: Self = Self { flags: libc::O_WRONLY };
+    /// read & write
+    pub const RDWR: Self = Self { flags: libc::O_RDWR };
+    /// create
+    pub const CREATE: Self = Self { flags: libc::O_CREAT };
+    /// append
+    pub const APPEND: Self = Self { flags: libc::O_APPEND };
+}
 
 pub struct IoUring {
     shared: Arc<IoState>,
@@ -116,7 +134,9 @@ impl IoUring {
                         let data = unsafe { Arc::from_raw(event.user_data() as *mut Mutex<CompletionState>) };
                         let mut guard = data.lock().expect("data lock poisoned");
                         guard.result = Some(event.result());
+                        if let Some(waker) = guard.waker.take() { waker.wake() };
                         if guard.exit_notification { exit = true }
+                        drop(guard);
                     }
                     exit
                 });
@@ -131,7 +151,7 @@ impl IoUring {
 
     }
 
-    fn submit<'b>(&self, entry: io_uring::squeue::Entry) -> io::Result<Completion<'b>> {
+    fn submit<'b, T>(&self, entry: io_uring::squeue::Entry, func: fn(i32) -> T) -> io::Result<Completion<'b, T>> {
 
         let state = Arc::new(Mutex::new(CompletionState {
             waker: None,
@@ -152,21 +172,32 @@ impl IoUring {
 
         Ok(Completion {
             state,
+            func,
             marker: PhantomData
         })
 
     }
 
-    pub fn read<'b>(&self, file: fs::File, buf: &'b mut [u8]) -> io::Result<Completion<'b>> {
+    pub fn open<'b, P: AsRef<path::Path>>(&self, path: P, options: OpenOptions) -> io::Result<Completion<'b, fs::File>> {
+        const CWD: io_uring::types::Fd = io_uring::types::Fd(-100); // represents the current working directory
+        let op = io_uring::opcode::OpenAt::new(
+            CWD,
+            path.as_ref().as_os_str().as_bytes().as_ptr() as *const i8
+        ).flags(options.flags).build();
+        self.submit(op, |fd| {
+            assert!(fd > 0);
+            unsafe { fs::File::from_raw_fd(fd) }
+        })
+    }
 
+
+    pub fn read<'b>(&self, file: fs::File, buf: &'b mut [u8]) -> io::Result<Completion<'b, usize>> {
         let op = io_uring::opcode::Read::new(
             io_uring::types::Fd(file.as_raw_fd()),
             buf.as_mut_ptr(),
             buf.len() as u32
         ).build();
-
-        self.submit(op)
-
+        self.submit(op, |val| val as usize)
     }
 
     fn kill_reaper(&self) {
@@ -216,17 +247,23 @@ pub fn is_queue_full(error: io::Error) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use std::fs;
-
     #[test]
     fn read() {
-        let io = crate::IoUring::new().unwrap();
-        let file = fs::File::open("src/foo.txt").unwrap();
-        let mut buf = [0; 1024];
-        io.read(file, &mut buf).unwrap();
-        std::thread::sleep_ms(1000);
-        println!("buf = {:?}", buf);
-        println!("{}", String::from_utf8_lossy(&buf))
+
+        extreme::run(async {
+
+            let io = crate::IoUring::new().unwrap();
+            let file = io.open("src/foo.txt", crate::OpenOptions::READ).unwrap().await.unwrap();
+
+            let mut buf = [0; 1024];
+            let bytes_read = io.read(file, &mut buf).unwrap().await.unwrap();
+            println!("Bytes read: {}", bytes_read);
+
+            let msg = String::from_utf8_lossy(&buf);
+            println!("{}", msg);
+
+        });
+        
     }
 
 }
