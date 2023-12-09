@@ -74,7 +74,7 @@ mod private_io_state {
 /// ```
 pub struct Completion<'a, T> {
     state: Arc<Mutex<CompletionKind>>,
-    is_done: bool,
+    pub(crate) is_done: CompletionIsDone,
     func: fn(i32) -> T,
     marker: PhantomData<&'a ()>
 }
@@ -89,12 +89,12 @@ impl<'a, T> future::Future for Completion<'a, T> {
                     if code.is_negative() {
                         let error = io::Error::from_raw_os_error(-*code);
                         drop(guard);
-                        self.is_done = true;
+                        self.is_done = CompletionIsDone::Done;
                         task::Poll::Ready(Err(error))
                     } else {
                         let val = (self.func)(*code);
                         drop(guard);
-                        self.is_done = true;
+                        self.is_done = CompletionIsDone::Done;
                         task::Poll::Ready(Ok(val))
                     }
                 } else {
@@ -105,7 +105,7 @@ impl<'a, T> future::Future for Completion<'a, T> {
             CompletionKind::WithError { error } => {
                 let value = error.take().unwrap();
                 drop(guard);
-                self.is_done = true;
+                self.is_done = CompletionIsDone::Done;
                 task::Poll::Ready(Err(value))
             },
             CompletionKind::ExitNotification => {
@@ -116,18 +116,24 @@ impl<'a, T> future::Future for Completion<'a, T> {
 }
 
 impl<'a, T> Drop for Completion<'a, T> {
-    // #[track_caller]
     fn drop(&mut self) {
-        if !self.is_done {
-            panic!("uring_fs completion dropped without being awaited")
+        if matches!(self.is_done, CompletionIsDone::NotDone) {
+            // sadly we can't put a #[track_caller] on the drop function
+            panic!("uring_fs: completion dropped without being awaited")
         }
     }
+}
+
+enum CompletionIsDone {
+    NotDone,
+    Done,
+    ExitNotification
 }
 
 enum CompletionKind {
     Regular { waker: Option<task::Waker>, result: Option<i32> },
     WithError { error: Option<io::Error> },
-    ExitNotification,
+    ExitNotification
 }
 
 impl CompletionKind {
@@ -318,7 +324,7 @@ impl IoUring {
 
         Completion {
             state,
-            is_done: false,
+            is_done: CompletionIsDone::NotDone,
             func,
             marker: PhantomData
         }
@@ -377,7 +383,8 @@ impl IoUring {
             &io_uring::types::Timespec::from(time::Duration::ZERO)
         ).build();
 
-        let _ = self.submit(op, CompletionKind::exit_notification(), |_| unreachable!());
+        let mut completion = self.submit(op, CompletionKind::exit_notification(), |_| unreachable!());
+        completion.is_done = CompletionIsDone::ExitNotification; // to make the check on drop happy
 
     }
 
