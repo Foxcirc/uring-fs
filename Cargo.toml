@@ -2,8 +2,10 @@
 name = "uring-fs"
 version = "0.1.0"
 edition = "2021"
-author = "whyfoxcirc@gmx.de"
 description = "Truly asynchronous file operations using io-uring. Supports any async runtime. Linux only."
 
 [dependencies]
 io-uring = "0.6.2"
+
+[dev-dependencies]
+extreme = "*"
