@@ -12,7 +12,7 @@
 //! let file: std::fs::File = io.open("foo.txt", uring_fs::OpenOptions::READ).await.unwrap();
 //! //        ^^^^^^^^^^^^^ you could also open the file using the standard library
 //! let mut buffer = [0; 1024];
-//! let bytes_read = io.read(&file, &mut buffer).await.unwrap(); // awaiting returns io::Result
+//! let bytes_read = unsafe { io.read(&file, &mut buffer) }.await.unwrap(); // awaiting returns io::Result
 //! # };
 //! ```
 //! See [`IoUring`] documentation for more important infos and examples.
@@ -173,9 +173,10 @@ impl OpenOptions {
 /// case that the submission queue is full using the [`is_queue_full`] function.
 ///
 /// # Important caveats
-/// Currently dropping a `Completion` without awaiting it may result in a data race, as the kernel will still
-/// have a mutable reference to your buffer.
-/// TODO: change this and make it actually safe and not UB
+/// Letting go of a `Completion` without it's destructor running (e.g. through `mem::forget`) it may result in a data race
+/// (which is undefined behaviour), as the kernel will still have a mutable reference to your buffer.
+/// If you do drop a completion without awaiting it, this will result in a panic.
+/// For this reason all functions that create a completion and take a mutable reference to a buffer are marked as unsafe.
 ///
 /// # Example of a basic file read
 /// ```no_run
@@ -184,7 +185,7 @@ impl OpenOptions {
 /// let io = IoUring::new().unwrap();
 /// let file = io.open("foo.txt", OpenOptions::READ).await.unwrap();
 /// let mut buf = [0; 1024];
-/// let bytes_read = io.read(&file, &mut buf).await.unwrap();
+/// let bytes_read = unsafe { io.read(&file, &mut buf) }.await.unwrap();
 /// # };
 /// ```
 ///
@@ -196,7 +197,7 @@ impl OpenOptions {
 /// let file = io.open("foo.txt", OpenOptions::READ).await.unwrap();
 /// for _ in 0..20 { // 20 iterations
 ///     let mut buf = [0; 1024];
-///     let result = io.read(&file, &mut buf).await; // on the 11th iteration this might start return errors
+///     let result = unsafe { io.read(&file, &mut buf) }.await; // on the 11th iteration this might start return errors
 ///     match result {
 ///         Ok(val) => println!("bytes read: {}", val),
 ///         Err(err) if is_queue_full(&err) => println!("submission queue full, submission canceled"),
@@ -243,6 +244,9 @@ impl IoUring {
 
                         shared_clone.in_flight.fetch_sub(1, atomic::Ordering::Relaxed);
 
+                        // it is safe to construct and later drop the Arc because for every
+                        // submission request we will get exactely one event here
+                        // this would break and produce undefined behaviour fore some opcodes!
                         let data = unsafe { Arc::from_raw(event.user_data() as *mut Mutex<CompletionKind>) };
                         let mut guard = data.lock().expect("data lock poisoned");
                         match &mut *guard {
@@ -293,12 +297,6 @@ impl IoUring {
             state = Arc::new(Mutex::new(CompletionKind::with_error(err)));
         }
 
-        if cfg!(debug_assertions) {
-            self.shared.with_submission(|submission| {
-                assert!(submission.is_empty());
-            });
-        }
-
         Completion {
             state,
             func,
@@ -326,7 +324,11 @@ impl IoUring {
     }
 
     /// Reads data from a file. Returns how many bytes were read.
-    pub fn read<'b>(&self, file: &fs::File, buf: &'b mut [u8]) -> Completion<'b, usize> {
+    ///
+    /// # Safety
+    /// You must ensure that the returned `Completion` is never dropped without it's destructor
+    /// running.
+    pub unsafe fn read<'b>(&self, file: &fs::File, buf: &'b mut [u8]) -> Completion<'b, usize> {
         let op = io_uring::opcode::Read::new(
             io_uring::types::Fd(file.as_raw_fd()),
             buf.as_mut_ptr(),
@@ -379,9 +381,8 @@ mod tests {
             let file = io.open("src/foo.txt", crate::OpenOptions::READ).await.unwrap();
 
             let mut buf = [0; 1024];
-            let bytes_read = io.read(&file, &mut buf).await.unwrap();
+            let bytes_read = unsafe { io.read(&file, &mut buf) }.await.unwrap();
             println!("Bytes read: {}", bytes_read);
-
             let msg = String::from_utf8_lossy(&buf);
             println!("{}", msg);
 
