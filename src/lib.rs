@@ -74,22 +74,27 @@ mod private_io_state {
 /// ```
 pub struct Completion<'a, T> {
     state: Arc<Mutex<CompletionKind>>,
+    is_done: bool,
     func: fn(i32) -> T,
     marker: PhantomData<&'a ()>
 }
 
 impl<'a, T> future::Future for Completion<'a, T> {
     type Output = io::Result<T>;
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
         let mut guard = self.state.lock().expect("data lock poisoned");
         match &mut *guard {
             CompletionKind::Regular { waker, result } => {
                 if let Some(code) = result {
                     if code.is_negative() {
                         let error = io::Error::from_raw_os_error(-*code);
+                        drop(guard);
+                        self.is_done = true;
                         task::Poll::Ready(Err(error))
                     } else {
                         let val = (self.func)(*code);
+                        drop(guard);
+                        self.is_done = true;
                         task::Poll::Ready(Ok(val))
                     }
                 } else {
@@ -98,11 +103,23 @@ impl<'a, T> future::Future for Completion<'a, T> {
                 }
             },
             CompletionKind::WithError { error } => {
-                task::Poll::Ready(Err(error.take().unwrap()))
+                let value = error.take().unwrap();
+                drop(guard);
+                self.is_done = true;
+                task::Poll::Ready(Err(value))
             },
             CompletionKind::ExitNotification => {
                 unreachable!();
             }
+        }
+    }
+}
+
+impl<'a, T> Drop for Completion<'a, T> {
+    // #[track_caller]
+    fn drop(&mut self) {
+        if !self.is_done {
+            panic!("uring_fs completion dropped without being awaited")
         }
     }
 }
@@ -173,10 +190,12 @@ impl OpenOptions {
 /// case that the submission queue is full using the [`is_queue_full`] function.
 ///
 /// # Important caveats
-/// Letting go of a `Completion` without it's destructor running (e.g. through `mem::forget`) it may result in a data race
-/// (which is undefined behaviour), as the kernel will still have a mutable reference to your buffer.
-/// If you do drop a completion without awaiting it, this will result in a panic.
-/// For this reason all functions that create a completion and take a mutable reference to a buffer are marked as unsafe.
+/// If you try to drop a [`Completion`] without `awaiting` it first, this will result in a panic.
+/// Letting go of a [`Completion`] without it's destructor running (e.g. through `mem::forget`) may result in a data race.
+/// This happens because the kernel may still access some data that was passed to `io_uring` until the completion is complete.
+/// For this reason all functions that create a completion are marked as unsafe.
+/// In practice however, it is very hard to create undefined behaviour, the [rio](https://docs.rs/rio) crate even goes as far,
+/// as to not have any of their methods marked as `unsafe`.
 ///
 /// # Example of a basic file read
 /// ```no_run
@@ -299,6 +318,7 @@ impl IoUring {
 
         Completion {
             state,
+            is_done: false,
             func,
             marker: PhantomData
         }
@@ -332,6 +352,20 @@ impl IoUring {
         let op = io_uring::opcode::Read::new(
             io_uring::types::Fd(file.as_raw_fd()),
             buf.as_mut_ptr(),
+            buf.len() as u32
+        ).build();
+        self.submit(op, CompletionKind::regular(), |val| val as usize)
+    }
+
+    /// Writes data to a file. Returns how many bytes were written.
+    ///
+    /// # Safety
+    /// You must ensure that the returned `Completion` is never dropped without it's destructor
+    /// running.
+    pub unsafe fn write<'b>(&self, file: &fs::File, buf: &'b [u8]) -> Completion<'b, usize> {
+        let op = io_uring::opcode::Write::new(
+            io_uring::types::Fd(file.as_raw_fd()),
+            buf.as_ptr(),
             buf.len() as u32
         ).build();
         self.submit(op, CompletionKind::regular(), |val| val as usize)
