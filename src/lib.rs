@@ -162,15 +162,21 @@ impl OpenOptions {
 }
 
 /// The main `io-uring` context. Used to perform I/O operations and obtain their completions.
+///
 /// A submission queue size (sq depth) can be specified using the [`with_size`](IoUring::with_size) method, or you can
-/// use a default value of `24` with the [`new`](IoUring::new).
-/// If the submission queue is overflown because to many I/O operations were queued, an attempt of
+/// use a default value of `8` with the [`new`](IoUring::new).
+///
+/// It should be pretty difficult to overflow the submission queue, since every request is immediatly
+/// submitted after it is created.
+/// If the it is overflown tough, because to many I/O operations were queued, an attempt of
 /// queueing another one will result in an [`io::Error`]. It is possible to test for the specific
-/// case that the queue is full using the [`is_queue_full`] function.
+/// case that the submission queue is full using the [`is_queue_full`] function.
+///
 /// # Important caveats
 /// Currently dropping a `Completion` without awaiting it may result in a data race, as the kernel will still
 /// have a mutable reference to your buffer.
 /// TODO: change this and make it actually safe and not UB
+///
 /// # Example of a basic file read
 /// ```no_run
 /// # async {
@@ -181,6 +187,7 @@ impl OpenOptions {
 /// let bytes_read = io.read(&file, &mut buf).await.unwrap();
 /// # };
 /// ```
+///
 /// # Example of overflowing the submission queue
 /// ```no_run
 /// # async {
@@ -205,10 +212,15 @@ pub struct IoUring {
 
 impl IoUring {
 
-    pub fn new() ->io::Result<Self> {
-        Self::with_size(24)
+    /// Starts a new `io_uring` system.
+    ///
+    /// Uses a default submission queue size of `8`.
+    /// For changing this size see [`with_size`](IoUring::with_size).
+    pub fn new() -> io::Result<Self> {
+        Self::with_size(8)
     }
 
+    /// Starts a new `io_uring` system with a specified submission queue size.
     pub fn with_size(size: u32) -> io::Result<Self> {
 
         let shared = Arc::new(IoState::new(io_uring::IoUring::new(size)?));
@@ -295,8 +307,14 @@ impl IoUring {
 
     }
 
+    /// Opens a file. Returns an [`std::fs::File`], you don't have to use this function to open
+    /// files.
+    ///
+    /// Opening files can sometimes block if they need to be created, emptied or more. This
+    /// function allows doing this in an asynchronous manner.
+    /// For more notes see [`OpenOptions`]..
     pub fn open<'b, P: AsRef<path::Path>>(&self, path: P, options: OpenOptions) -> Completion<'b, fs::File> {
-        const CWD: io_uring::types::Fd = io_uring::types::Fd(-100); // represents the current working directory
+        const CWD: io_uring::types::Fd = io_uring::types::Fd(libc::AT_FDCWD); // represents the current working directory
         let op = io_uring::opcode::OpenAt::new(
             CWD,
             path.as_ref().as_os_str().as_bytes().as_ptr() as *const i8
@@ -307,7 +325,7 @@ impl IoUring {
         })
     }
 
-
+    /// Reads data from a file. Returns how many bytes were read.
     pub fn read<'b>(&self, file: &fs::File, buf: &'b mut [u8]) -> Completion<'b, usize> {
         let op = io_uring::opcode::Read::new(
             io_uring::types::Fd(file.as_raw_fd()),
@@ -342,6 +360,7 @@ impl Drop for IoUring {
 }
 
 /// Determines if this [`io::Error`] signals that the io-uring submission queue is full.
+///
 /// If the queue seems so be full regularely the queue size should be increased.
 /// This is a possible error returned by any function that queues a new IO operation.
 pub fn is_queue_full(error: &io::Error) -> bool {
