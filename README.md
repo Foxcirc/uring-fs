@@ -4,11 +4,11 @@ Features:
 - Truly asynchronous file operations using io-uring.
 - Supports any async runtime.
 - Linux only.
-- Only depends on `io_uring` and `libc`.
+- Only depends on [io_uring](https://crates.io/crates/io_uring) and [libc](https://crates.io/crates/libc).
 
 # Links
-[crates.io](https://crates.io/crates/uring-fs)
-[docs.rs](https://docs.rs/uring-fs)
+- [crates.io](https://crates.io/crates/uring-fs)
+- [docs.rs](https://docs.rs/uring-fs)
 
 # Example
 ```rust

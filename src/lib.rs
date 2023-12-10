@@ -3,7 +3,7 @@
 //! - Truly asynchronous file operations using io-uring.
 //! - Supports any async runtime.
 //! - Linux only.
-//! - Only depends on `io_uring` and `libc`.
+//! - Only depends on [io_uring](https://crates.io/crates/io_uring) and [libc](https://crates.io/crates/libc).
 //!
 //! # Example
 //! ```no_run
