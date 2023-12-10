@@ -7,12 +7,13 @@
 //!
 //! # Example
 //! ```no_run
-//! # async {
-//! let io = uring_fs::IoUring::new().unwrap(); // implements Send + Sync
-//! let file = unsafe { io.open("foo.txt", uring_fs::OpenOptions::READ) }.await.unwrap();
+//! # async fn foo() -> std::io::Result<()> {
+//! let io = uring_fs::IoUring::new()?; // IoUring implements Send + Sync
+//! let file = unsafe { io.open("foo.txt", uring_fs::OpenOptions::READ) }.await?;
 //! //         ^^^^^^ see IoUring docs for why this is unsafe
 //! let mut buffer = [0; 1024];
-//! let bytes_read = unsafe { io.read(&file, &mut buffer) }.await.unwrap(); // awaiting returns io::Result
+//! let bytes_read = unsafe { io.read(&file, &mut buffer) }.await?; // awaiting returns io::Result
+//! # Ok(())
 //! # };
 //! ```
 //! See [`IoUring`] documentation for more important infos and examples.
@@ -22,10 +23,10 @@
 //! This is nesessary for compatibility across runtimes.
 //!
 //! Please also note that the code for this library is not tested very well and might
-//! contain some subtle undefined behaviour. The source code isn't very big and you can always
+//! contain some subtle undefined behaviour. This library isn't very big and you can always
 //! verify and fork it yourself.
 
-use std::{fmt, error, io, thread, sync::{Arc, Mutex, atomic}, os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path};
+use std::{fmt, error, io, thread, sync::{Arc, Mutex, atomic}, os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path, mem};
 use private_io_state::IoState;
 
 mod private_io_state {
@@ -69,13 +70,15 @@ mod private_io_state {
 
 }
 
+const CWD: io_uring::types::Fd = io_uring::types::Fd(libc::AT_FDCWD); // represents the current working directory
+
 /// A future that will complete once a file operation is complete.
 /// Dropping a completion will not cancel the associated I/O operation which will still be
 /// executed by the kernel.
 /// # Example
 /// ```ignore
 /// let my_completion = ...;
-/// let value = my_completion.await.unwrap();
+/// let value = my_completion.await?;
 /// ```
 pub struct Completion<'a, T> {
     state: Arc<Mutex<CompletionKind>>,
@@ -195,8 +198,7 @@ impl OpenOptions {
 
 /// Represents an open file.
 ///
-/// You can convert the returned [`File`] to a [`std::fs::File`] by converting the file to raw
-/// handle and back.
+/// You can convert from/to a [`std::fs::File`] by converting to a raw fd and back.
 pub struct File {
     fd: RawFd
 }
@@ -213,51 +215,48 @@ impl AsRawFd for File {
     }
 }
 
+/// Information about a file.
+pub struct Stat {
+    pub inner: libc::statx,
+}
+
+impl Stat {
+    fn new(inner: libc::statx) -> Self {
+        Self { inner }
+    }
+    /// The file size.
+    pub fn size(&self) -> u64 {
+        self.inner.stx_size
+    }
+}
+
 /// The main io-uring context. Used to perform I/O operations and obtain their completions.
 ///
-/// A submission queue size (sq depth) can be specified using the [`new_with_size`](IoUring::new_with_size) method, or you can
-/// use a default value of `8` with the [`new`](IoUring::new).
+/// - [`new`](IoUring::new): default queue size of `8`
+/// - [`new_with_size`](IoUring::new_with_size): custom queue size
 ///
-/// It should be pretty difficult to overflow the submission queue, since every request is immediatly
-/// submitted after it is created.
-/// If the it is overflown tough, because to many I/O operations were queued, an attempt of
-/// queueing another one will result in an [`io::Error`]. It is possible to test for the specific
-/// case that the submission queue is full using the [`is_queue_full`] function.
+/// Every request is immediatly submitted after it is created, which makes it really hard to
+/// overflow the submission queue.
+/// However it is possible to check using the [`is_queue_full`] function.
 ///
 /// # Important caveats
-/// If you try to drop a [`Completion`] without `awaiting` it first, this will result in a panic.
-/// Letting go of a [`Completion`] without it's destructor running (e.g. through `mem::forget`) may result in a data race.
+/// - Trying to drop a [`Completion`] without `awaiting` it first, will result in a panic.
+/// - Letting go of a [`Completion`] without it's destructor running (e.g. through `mem::forget`) may result in a data race.
+///
 /// This happens because the kernel may still access some data that was passed to `io_uring` until the completion is complete.
 /// For this reason all functions that create a completion are marked as unsafe.
 /// In practice however, it is very hard to create undefined behaviour, the [rio](https://docs.rs/rio) crate even goes as far,
 /// as to not have any of their methods marked as `unsafe`.
 ///
-/// # Example of a basic file read
+/// # Example
 /// ```no_run
-/// # async {
+/// # async fn foo() -> std::io::Result<()> {
 /// use uring_fs::{IoUring, OpenOptions};
-/// let io = IoUring::new().unwrap();
-/// let file = unsafe { io.open("foo.txt", OpenOptions::READ) }.await.unwrap();
+/// let io = IoUring::new()?;
+/// let file = unsafe { io.open("foo.txt", OpenOptions::READ) }.await?;
 /// let mut buf = [0; 1024];
-/// let bytes_read = unsafe { io.read(&file, &mut buf) }.await.unwrap();
-/// # };
-/// ```
-///
-/// # Example of overflowing the submission queue
-/// ```no_run
-/// # async {
-/// use uring_fs::{IoUring, OpenOptions, is_queue_full};
-/// let io = IoUring::new_with_size(10).unwrap(); // only enough space for 10 concurrent operations
-/// let file = unsafe { io.open("foo.txt", OpenOptions::READ) }.await.unwrap();
-/// for _ in 0..20 { // 20 iterations
-///     let mut buf = [0; 1024];
-///     let result = unsafe { io.read(&file, &mut buf) }.await; // on the 11th iteration this might start return errors
-///     match result {
-///         Ok(val) => println!("bytes read: {}", val),
-///         Err(err) if is_queue_full(&err) => println!("submission queue full, submission canceled"),
-///         Err(other) => panic!("unexpected error: {}", other)
-///     }
-/// }
+/// let bytes_read = unsafe { io.read(&file, &mut buf) }.await?;
+/// # Ok(())
 /// # };
 /// ```
 pub struct IoUring {
@@ -370,7 +369,6 @@ impl IoUring {
     /// You must ensure that the returned `Completion` is never dropped without it's destructor
     /// running.
     pub unsafe fn open<'b, P: AsRef<path::Path>>(&self, path: P, options: OpenOptions) -> Completion<'b, File> {
-        const CWD: io_uring::types::Fd = io_uring::types::Fd(libc::AT_FDCWD); // represents the current working directory
         let op = io_uring::opcode::OpenAt::new(
             CWD,
             path.as_ref().as_os_str().as_bytes().as_ptr() as *const i8
@@ -397,8 +395,6 @@ impl IoUring {
 
     /// Writes data to a file. Returns how many bytes were written.
     ///
-    /// Note that seeking using the [`Seek`](std::io::Seek) trait doesn't work.
-    ///
     /// # Safety
     /// You must ensure that the returned `Completion` is never dropped without it's destructor
     /// running.
@@ -409,6 +405,22 @@ impl IoUring {
             buf.len() as u32
         ).build();
         self.submit(op, CompletionKind::regular(), |val| val as usize)
+    }
+
+    /// Stats a file.
+    ///
+    /// # Safety
+    /// You must ensure that the returned future is never dropped without it's destructor
+    /// running.
+    pub async unsafe fn stat<'b, P: AsRef<path::Path>>(&self, path: P) -> io::Result<Stat> {
+        let mut statx: mem::MaybeUninit<libc::statx> = mem::MaybeUninit::uninit();
+        let op = io_uring::opcode::Statx::new(
+            CWD,
+            path.as_ref().as_os_str().as_bytes().as_ptr() as *const i8,
+            statx.as_mut_ptr() as *mut io_uring::types::statx,
+        ).build();
+        self.submit(op, CompletionKind::regular(), |_| ()).await?;
+        Ok(Stat::new(unsafe { statx.assume_init() }))
     }
 
     fn kill_reaper(&self) {
@@ -438,8 +450,16 @@ impl Drop for IoUring {
 
 /// Determines if this [`io::Error`] signals that the io-uring submission queue is full.
 ///
-/// If the queue seems so be full regularely the queue size should be increased.
 /// This is a possible error returned by any function that queues a new IO operation.
+///
+/// # Example
+/// ```ignore
+/// match unsafe { io.read(&file, &mut buf) }.await {
+///     Ok(..) => (),
+///     Err(ref err) if is_queue_full(err) => ...,
+///     Err(other) => ...,
+/// };
+/// ```
 pub fn is_queue_full(error: &io::Error) -> bool {
     error.get_ref().map(|inner| inner.downcast_ref::<QueueFull>().is_some()).unwrap_or(false)
 }
@@ -453,7 +473,10 @@ mod tests {
         extreme::run(async {
 
             let io = crate::IoUring::new().unwrap();
-            let file = unsafe { io.open("src/foo.txt", crate::OpenOptions::RDWR) }.await.unwrap();
+            let file = unsafe { io.open("src/foo.txt", crate::OpenOptions::RDWR) }.await.unwrap(); // todo: absolute path doesnt work!!!
+
+            let info = unsafe { io.stat("src/foo.txt") }.await.unwrap();
+            println!("File size: {}", info.size());
 
             let mut buf = [0; 1024];
             let bytes_read = unsafe { io.read(&file, &mut buf) }.await.unwrap();
@@ -462,10 +485,9 @@ mod tests {
             let bytes_written = unsafe { io.write(&file, &buf[..bytes_read]) }.await.unwrap();
             println!("Bytes written: {}", bytes_written);
 
-            let bytes_written = unsafe { io.write(&file, &buf[..bytes_read]) }.await.unwrap();
-            println!("Bytes written: {}", bytes_written);
-
-            assert!(bytes_read == bytes_written && bytes_read > 0);
+            assert!(bytes_read > 0);
+            assert!(bytes_read == info.size() as usize);
+            assert!(bytes_read == bytes_written);
 
         });
         
