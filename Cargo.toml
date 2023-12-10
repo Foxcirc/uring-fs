@@ -14,4 +14,4 @@ io-uring = "0.6.*"
 libc = { version = "0.2.98", default-features = false }
 
 [dev-dependencies]
-extreme = "*"
+extreme = "6.*"
