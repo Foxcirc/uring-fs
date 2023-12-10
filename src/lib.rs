@@ -230,10 +230,7 @@ impl Stat {
 /// - Trying to drop a [`Completion`] without `awaiting` it first, will result in a panic.
 /// - Letting go of a [`Completion`] without it's destructor running (e.g. through `mem::forget`) may result in a data race.
 ///
-/// This happens because the kernel may still access some data that was passed to `io_uring` until the completion is complete.
-/// For this reason all functions that create a completion are marked as unsafe.
-/// In practice however, it is very hard to create undefined behaviour, the [rio](https://docs.rs/rio) crate even goes as far,
-/// as to not have any of their methods marked as `unsafe`.
+/// For this reason some functions that create a completion are marked as unsafe.
 ///
 /// # Example
 /// ```no_run
