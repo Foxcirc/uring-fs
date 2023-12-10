@@ -11,8 +11,7 @@
 //! let io = uring_fs::IoUring::new()?; // IoUring implements Send + Sync
 //! let file = unsafe { io.open("foo.txt", uring_fs::OpenOptions::READ) }.await?;
 //! //         ^^^^^^ see IoUring docs for why this is unsafe
-//! let mut buffer = [0; 1024];
-//! let bytes_read = unsafe { io.read(&file, &mut buffer) }.await?; // awaiting returns io::Result
+//! let data = io.read_all(&file).await?; // awaiting returns io::Result
 //! # Ok(())
 //! # };
 //! ```
@@ -26,7 +25,7 @@
 //! contain some subtle undefined behaviour. This library isn't very big and you can always
 //! verify and fork it yourself.
 
-use std::{fmt, error, io, thread, sync::{Arc, Mutex, atomic}, os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path, mem};
+use std::{io, thread, sync::{Arc, Mutex, atomic}, os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path, mem};
 use private_io_state::IoState;
 
 mod private_io_state {
@@ -156,18 +155,6 @@ impl CompletionKind {
     }
 }
 
-/// Error indicating that the submission queue is full.
-///
-/// Should be checked using [`is_queue_full`].
-pub struct QueueFull;
-impl fmt::Debug for QueueFull {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "the io-uring submission queue is full") }
-}
-impl fmt::Display for QueueFull {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "the io-uring submission queue is full") }
-}
-impl error::Error for QueueFull {}
-
 /// In what mode to open a file.
 ///
 /// It is not possible use [`std::fs::OpenOptions`] because it doesn't support retreiving the raw `flags`
@@ -255,7 +242,7 @@ impl Stat {
 /// let io = IoUring::new()?;
 /// let file = unsafe { io.open("foo.txt", OpenOptions::READ) }.await?;
 /// let mut buf = [0; 1024];
-/// let bytes_read = unsafe { io.read(&file, &mut buf) }.await?;
+/// let bytes_read = unsafe { io.read_at(&file, &mut buf, 0u64) }.await?;
 /// # Ok(())
 /// # };
 /// ```
@@ -336,10 +323,10 @@ impl IoUring {
             // SAFETY: `op` will be valid
             unsafe { submission.push(&prepared) }
         });
-        if let Err(..) = result {
+        if let Err(err) = result {
             // make sure to cleanup the completion's data
             unsafe { Arc::from_raw(prepared.get_user_data() as *mut Arc<Mutex<CompletionKind>>) };
-            state = Arc::new(Mutex::new(CompletionKind::with_error(io::Error::new(io::ErrorKind::Other, QueueFull))));
+            state = Arc::new(Mutex::new(CompletionKind::with_error(io::Error::new(io::ErrorKind::Other, err))));
         }
 
         self.shared.in_flight.fetch_add(1, atomic::Ordering::Relaxed);
@@ -368,7 +355,7 @@ impl IoUring {
     /// # Safety
     /// You must ensure that the returned `Completion` is never dropped without it's destructor
     /// running.
-    pub unsafe fn open<'b, P: AsRef<path::Path>>(&self, path: P, options: OpenOptions) -> Completion<'b, File> {
+    pub unsafe fn open<'b, P: AsRef<path::Path> + 'b>(&self, path: P, options: OpenOptions) -> Completion<'b, File> {
         let op = io_uring::opcode::OpenAt::new(
             CWD,
             path.as_ref().as_os_str().as_bytes().as_ptr() as *const i8
@@ -379,32 +366,79 @@ impl IoUring {
         })
     }
 
-    /// Reads data from a file. Returns how many bytes were read.
+    /// Reads data from a file at an offset. Returns how many bytes were read.
+    ///
+    /// If you wanna safely read a whole file you should use
+    /// - [`read_all`](IoUring::read_all)
+    /// - [`read_to_string`](IoUring::read_to_string)
     ///
     /// # Safety
     /// You must ensure that the returned `Completion` is never dropped without it's destructor
     /// running.
-    pub unsafe fn read<'b>(&self, file: &File, buf: &'b mut [u8]) -> Completion<'b, usize> {
+    pub unsafe fn read_at<'b>(&self, file: &File, buf: &'b mut [u8], offset: u64) -> Completion<'b, usize> {
         let op = io_uring::opcode::Read::new(
             io_uring::types::Fd(file.as_raw_fd()),
             buf.as_mut_ptr(),
             buf.len() as u32
-        ).build();
+        ).offset(offset).build();
         self.submit(op, CompletionKind::regular(), |val| val as usize)
     }
 
-    /// Writes data to a file. Returns how many bytes were written.
+    /// Reads the whole file.
+    pub async fn read_all<'b>(&self, file: &File) -> io::Result<Vec<u8>> {
+
+        let mut buf = Vec::new();
+        let mut to_read = 1024;
+        let mut total_bytes_read = 0;
+        loop {
+            let len = buf.len();
+            buf.resize(len + to_read, 0);
+            let bytes_read = unsafe { self.read_at(&file, &mut buf[len..len + to_read], total_bytes_read as u64) }.await?;
+            buf.truncate(len + bytes_read);
+            to_read *= 2;
+            total_bytes_read += bytes_read;
+            if bytes_read == 0 { break }
+        }
+
+        Ok(buf)
+
+    }
+
+    /// Reads the whole file as a string.
+    ///
+    /// Returns error if the file was not valid utf8.
+    /// You can check for it using the [`is_not_utf8`] function.
+    pub async fn read_to_string<'b>(&self, file: &File) -> io::Result<String> {
+
+        let buf = self.read_all(file).await?;
+        String::from_utf8(buf).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+
+    }
+
+    /// Writes data to a file at an offset. Returns how many bytes were written.
     ///
     /// # Safety
     /// You must ensure that the returned `Completion` is never dropped without it's destructor
     /// running.
-    pub unsafe fn write<'b>(&self, file: &File, buf: &'b [u8]) -> Completion<'b, usize> {
+    pub unsafe fn write_at<'b>(&self, file: &File, buf: &'b [u8], offset: u64) -> Completion<'b, usize> {
         let op = io_uring::opcode::Write::new(
             io_uring::types::Fd(file.as_raw_fd()),
             buf.as_ptr(),
             buf.len() as u32
-        ).build();
+        ).offset(offset).build();
         self.submit(op, CompletionKind::regular(), |val| val as usize)
+    }
+
+    /// Writes all data to a file.
+    pub async fn write_all<'b>(&self, file: &File, mut buf: &'b [u8]) -> io::Result<()> {
+        let mut total_bytes_written = 0;
+        loop {
+            let bytes_written = unsafe { self.write_at(&file, buf, total_bytes_written as u64) }.await?;
+            total_bytes_written += bytes_written;
+            buf = &buf[bytes_written..];
+            if buf.len() == 0 { break }
+        }
+        Ok(())
     }
 
     /// Stats a file.
@@ -412,7 +446,7 @@ impl IoUring {
     /// # Safety
     /// You must ensure that the returned future is never dropped without it's destructor
     /// running.
-    pub async unsafe fn stat<'b, P: AsRef<path::Path>>(&self, path: P) -> io::Result<Stat> {
+    pub async unsafe fn stat<'b, P: AsRef<path::Path> + 'b>(&self, path: P) -> io::Result<Stat> {
         let mut statx: mem::MaybeUninit<libc::statx> = mem::MaybeUninit::uninit();
         let op = io_uring::opcode::Statx::new(
             CWD,
@@ -454,14 +488,21 @@ impl Drop for IoUring {
 ///
 /// # Example
 /// ```ignore
-/// match unsafe { io.read(&file, &mut buf) }.await {
+/// match unsafe { io.read_at(&file, &mut buf, 0) }.await {
 ///     Ok(..) => (),
 ///     Err(ref err) if is_queue_full(err) => ...,
 ///     Err(other) => ...,
 /// };
 /// ```
 pub fn is_queue_full(error: &io::Error) -> bool {
-    error.get_ref().map(|inner| inner.downcast_ref::<QueueFull>().is_some()).unwrap_or(false)
+    error.get_ref().map(|inner| inner.downcast_ref::<io_uring::squeue::PushError>().is_some()).unwrap_or(false)
+}
+
+/// Determines if this [`io::Error`] signals that the io-uring submission queue is full.
+///
+/// This is a possible error returned by [`IoUring::read_to_string`].
+pub fn is_not_utf8(error: &io::Error) -> bool {
+    error.get_ref().map(|inner| inner.downcast_ref::<std::string::FromUtf8Error>().is_some()).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -473,17 +514,20 @@ mod tests {
         extreme::run(async {
 
             let io = crate::IoUring::new().unwrap();
-            let file = unsafe { io.open("src/foo.txt", crate::OpenOptions::RDWR) }.await.unwrap(); // todo: absolute path doesnt work!!!
+
+            let file = unsafe { io.open("src/foo.txt", crate::OpenOptions::RDWR) }.await.unwrap(); // todo: absolute path doesnt work!!! also: copy the path string so this can be safe
 
             let info = unsafe { io.stat("src/foo.txt") }.await.unwrap();
             println!("File size: {}", info.size());
 
-            let mut buf = [0; 1024];
-            let bytes_read = unsafe { io.read(&file, &mut buf) }.await.unwrap();
+            let buf = io.read_all(&file).await.unwrap();
+            let bytes_read = buf.len();
             println!("Bytes read: {}", bytes_read);
 
-            let bytes_written = unsafe { io.write(&file, &buf[..bytes_read]) }.await.unwrap();
+            let bytes_written = unsafe { io.write_at(&file, &buf, 0) }.await.unwrap();
             println!("Bytes written: {}", bytes_written);
+
+            io.write_all(&file, b"Hello world, this is awesome!").await.unwrap();
 
             assert!(bytes_read > 0);
             assert!(bytes_read == info.size() as usize);
