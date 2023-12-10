@@ -2,7 +2,11 @@
 name = "uring-fs"
 version = "0.1.0"
 edition = "2021"
+authors = ["foxcirc"]
 description = "Truly asynchronous file operations using io-uring. Supports any async runtime. Linux only."
+keywords = ["async", "fs", "async-fs", "io_uring", "io"]
+categories = ["asynchronous", "filesystem"]
+repository = "https://github.com/Foxcirc/uring-fs"
 license = "MIT"
 
 [dependencies]
