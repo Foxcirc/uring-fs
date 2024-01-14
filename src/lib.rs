@@ -1,538 +1,494 @@
 
 //! # Features
-//! - Truly asynchronous file operations using io-uring.
-//! - Supports any async runtime.
-//! - Linux only.
-//! - Only depends on [io_uring](https://crates.io/crates/io_uring) and [libc](https://crates.io/crates/libc).
+//! - Truly asynchronous and safe file operations using io-uring.
+//! - Usable with any async runtime.
+//! - Supports: open, stat, read, write.
+//! - Depends on [io_uring](https://crates.io/crates/io_uring) and [libc](https://crates.io/crates/libc).
+//!   So it doesn't run on any operating systems that these don't support.
 //!
-//! # Example
-//! ```no_run
-//! # async fn foo() -> std::io::Result<()> {
-//! let io = uring_fs::IoUring::new()?; // IoUring implements Send + Sync
-//! let file = unsafe { io.open("foo.txt", uring_fs::OpenOptions::READ) }.await?;
-//! //         ^^^^^^ see IoUring docs for why this is unsafe
-//! let data = io.read_all(&file).await?; // awaiting returns io::Result
-//! # Ok(())
-//! # };
-//! ```
 //! See [`IoUring`] documentation for more important infos and examples.
+//! 
+//! # Example
+//! ```rust
+//! # use uring_fs::*;
+//! # use std::fs;
+//! # use std::io::{self, Seek, SeekFrom};
+//! # fn main() -> io::Result<()> {
+//! # extreme::run(async{
+//! let io = IoUring::new()?; // create a new io-uring context
+//! let mut file: fs::File = io.open("src/foo.txt", Flags::RDONLY).await?;
+//! //            ^^^^ you could also use File::open or OpenOptions
+//! let info = io.stat("src/foo.txt").await?;
+//! // there is also read_all, which doesn't require querying the file size
+//! // using stat, however this is a bit more efficient since we only allocate the data buffer once
+//! let content = io.read(&file, info.size()).await?;
+//! println!("we read {} bytes", content.len());
+//! // btw you can also seek the file using io::Seek
+//! file.seek(SeekFrom::Current(-10));
+//! Ok(())
+//! # })
+//! # }
+//!```
 //!
 //! # Notes
-//! This library will spawn a reaper thread that waits for io-uring completions and notifies the waker.
-//! This is nesessary for compatibility across runtimes.
+//! This library will spawn a reaper thread that waits for io-uring completions and notifies the apropriate future.
+//! Still, this is light weight in comparison to using a thread pool.
+//!
+//! This crate doesn't have the same soundness problems as `rio`, however it isn't as powerfull.
+//! If you want to use `rio`, remember to, at some point, enable the `no_metrics` feature!
+//! Otherwise there will be a ~100ms initial allocation of space used to store the performance metrics.
 //!
 //! Please also note that the code for this library is not tested very well and might
-//! contain some subtle undefined behaviour. This library isn't very big and you can always
-//! verify and fork it yourself.
+//! contain some subtle undefined behaviour. This library is kept small and hackable so
+//! you can always verify and fork it yourself.
 
-use std::{io, thread, sync::{Arc, Mutex, atomic}, os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::prelude::OsStrExt}, task, future, pin::Pin, marker::PhantomData, time, path, mem};
-use private_io_state::IoState;
+use std::{
+    path::Path,
+    thread,
+    task,
+    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}},
+    io,
+    os::fd::{RawFd, FromRawFd, AsRawFd},
+    task::Waker,
+    pin::Pin,
+    future::Future, mem::zeroed, cell::UnsafeCell, fs::File,
+};
 
-mod private_io_state {
+use io_uring::opcode;
 
-    use std::sync::{Mutex, atomic};
-
-    pub struct IoState {
-        io_uring: io_uring::IoUring,
-        sq_lock: Mutex<()>,
-        cq_lock: Mutex<()>,
-        pub in_flight: atomic::AtomicUsize,
-    }
-
-    impl IoState {
-        pub fn new(io_uring: io_uring::IoUring) -> Self {
-            Self {
-                io_uring,
-                sq_lock: Mutex::new(()),
-                cq_lock: Mutex::new(()),
-                in_flight: atomic::AtomicUsize::new(0),
-            }
-        }
-        pub fn submitter(&self) -> io_uring::Submitter {
-            self.io_uring.submitter()
-        }
-        pub fn with_submission<T>(&self, func: impl FnOnce(io_uring::SubmissionQueue) -> T) -> T {
-            let guard = self.sq_lock.lock().expect("sq_lock poisoned");
-            let sq = unsafe { self.io_uring.submission_shared() };
-            let result = func(sq);
-            drop(guard);
-            result
-        }
-        pub fn with_completion<T>(&self, func: impl FnOnce(io_uring::CompletionQueue) -> T) -> T {
-            let guard = self.cq_lock.lock().expect("sq_lock poisoned");
-            let cq = unsafe { self.io_uring.completion_shared() };
-            let result = func(cq);
-            drop(guard);
-            result
-        }
-    }
-
-}
-
-const CWD: io_uring::types::Fd = io_uring::types::Fd(libc::AT_FDCWD); // represents the current working directory
-
-/// A future that will complete once a file operation is complete.
-/// Dropping a completion will not cancel the associated I/O operation which will still be
-/// executed by the kernel.
-/// # Example
-/// ```ignore
-/// let my_completion = ...;
-/// let value = my_completion.await?;
-/// ```
-pub struct Completion<'a, T> {
-    state: Arc<Mutex<CompletionKind>>,
-    pub(crate) is_done: CompletionIsDone,
-    func: fn(i32) -> T,
-    marker: PhantomData<&'a ()>
-}
-
-impl<'a, T> future::Future for Completion<'a, T> {
-    type Output = io::Result<T>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> task::Poll<Self::Output> {
-        let mut guard = self.state.lock().expect("data lock poisoned");
-        match &mut *guard {
-            CompletionKind::Regular { waker, result } => {
-                if let Some(code) = result {
-                    if code.is_negative() {
-                        let error = io::Error::from_raw_os_error(-*code);
-                        drop(guard);
-                        self.is_done = CompletionIsDone::Done;
-                        task::Poll::Ready(Err(error))
-                    } else {
-                        let val = (self.func)(*code);
-                        drop(guard);
-                        self.is_done = CompletionIsDone::Done;
-                        task::Poll::Ready(Ok(val))
-                    }
-                } else {
-                    *waker = Some(cx.waker().clone());
-                    task::Poll::Pending
-                }
-            },
-            CompletionKind::WithError { error } => {
-                let value = error.take().unwrap();
-                drop(guard);
-                self.is_done = CompletionIsDone::Done;
-                task::Poll::Ready(Err(value))
-            },
-            CompletionKind::ExitNotification => {
-                unreachable!();
-            }
-        }
-    }
-}
-
-impl<'a, T> Drop for Completion<'a, T> {
-    fn drop(&mut self) {
-        if matches!(self.is_done, CompletionIsDone::NotDone) {
-            // sadly we can't put a #[track_caller] on the drop function
-            panic!("uring_fs: completion dropped without being awaited")
-        }
-    }
-}
-
-enum CompletionIsDone {
-    NotDone,
-    Done,
-    ExitNotification
-}
-
-enum CompletionKind {
-    Regular { waker: Option<task::Waker>, result: Option<i32> },
-    WithError { error: Option<io::Error> },
-    ExitNotification
-}
-
-impl CompletionKind {
-    fn regular() -> Self {
-        Self::Regular { waker: None, result: None }
-    }
-    fn with_error(error: io::Error) -> Self {
-        Self::WithError { error: Some(error) }
-    }
-    fn exit_notification() -> Self {
-        Self::ExitNotification
-    }
-}
-
-/// In what mode to open a file.
+/// An `io-uring` subsystem. Can be shared between threads safely.
 ///
-/// It is not possible use [`std::fs::OpenOptions`] because it doesn't support retreiving the raw `flags`
-/// that would be passed to a call to `openat`. (Please tell me if it does and I just didn't see it!)
-/// # Example
-/// ```no_run
-/// # use uring_fs::OpenOptions;
-/// let read_options = OpenOptions::READ;
-/// let append_options = OpenOptions::APPEND;
-/// let special_options = OpenOptions { flags: libc::O_RDWR | libc::O_TMPFILE };
-/// ```
-pub struct OpenOptions {
-    pub flags: i32
-}
-
-impl OpenOptions {
-    /// read only
-    pub const READ: Self = Self { flags: libc::O_RDONLY };
-    /// write only
-    pub const WRITE: Self = Self { flags: libc::O_WRONLY };
-    /// read & write
-    pub const RDWR: Self = Self { flags: libc::O_RDWR };
-    /// create
-    pub const CREATE: Self = Self { flags: libc::O_CREAT };
-    /// append
-    pub const APPEND: Self = Self { flags: libc::O_APPEND };
-}
-
-/// Represents an open file.
-///
-/// You can convert from/to a [`std::fs::File`] by converting to a raw fd and back.
-pub struct File {
-    fd: RawFd
-}
-
-impl FromRawFd for File {
-    unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Self { fd }
-    }
-}
-
-impl AsRawFd for File {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
-/// Information about a file.
-pub struct Stat {
-    pub inner: libc::statx,
-}
-
-impl Stat {
-    fn new(inner: libc::statx) -> Self {
-        Self { inner }
-    }
-    /// The file size.
-    pub fn size(&self) -> u64 {
-        self.inner.stx_size
-    }
-}
-
-/// The main io-uring context. Used to perform I/O operations and obtain their completions.
-///
-/// - [`new`](IoUring::new): default queue size of `8`
-/// - [`new_with_size`](IoUring::new_with_size): custom queue size
-///
-/// Every request is immediatly submitted after it is created, which makes it really hard to
-/// overflow the submission queue.
-/// However it is possible to check using the [`is_queue_full`] function.
-///
-/// # Important caveats
-/// - Trying to drop a [`Completion`] without `awaiting` it first, will result in a panic.
-/// - Letting go of a [`Completion`] without it's destructor running (e.g. through `mem::forget`) may result in a data race.
-///
-/// For this reason some functions that create a completion are marked as unsafe.
-///
-/// # Example
-/// ```no_run
-/// # async fn foo() -> std::io::Result<()> {
-/// use uring_fs::{IoUring, OpenOptions};
-/// let io = IoUring::new()?;
-/// let file = unsafe { io.open("foo.txt", OpenOptions::READ) }.await?;
-/// let mut buf = [0; 1024];
-/// let bytes_read = unsafe { io.read_at(&file, &mut buf, 0u64) }.await?;
-/// # Ok(())
-/// # };
-/// ```
+/// Will spawn a thread on creation. On drop it will stop the thread, but wait for any I/O operations
+/// to complete first.
+/// If this waiting is an issue to you, you should call [`cancel_all`](IoUring::cancel_all) to cancel all operations.
+/// This will, however leak some memory for every active operation.
 pub struct IoUring {
-    shared: Arc<IoState>,
-    reaper: Option<thread::JoinHandle<()>>,
-}
-
-impl IoUring {
-
-    /// Starts a new `io_uring` system.
-    ///
-    /// Uses a default submission queue size of `8`.
-    /// For changing this size see [`new_with_size`](IoUring::new_with_size).
-    pub fn new() -> io::Result<Self> {
-        Self::new_with_size(8)
-    }
-
-    /// Starts a new `io_uring` system with a specified submission queue size.
-    pub fn new_with_size(size: u32) -> io::Result<Self> {
-
-        let shared = Arc::new(IoState::new(io_uring::IoUring::new(size)?));
-        let shared_clone = Arc::clone(&shared);
-
-        let reaper = thread::spawn(move || {
-
-            let submitter = shared_clone.submitter();
-
-            loop {
-
-                match submitter.submit_and_wait(1) {
-                    Ok(..) => (),
-                    Err(err) => panic!("reaper thread encountered an error: {}", err)
-                }
-
-                let exit = shared_clone.with_completion(|completion| {
-                    let mut exit = false;
-                    for event in completion {
-
-                        shared_clone.in_flight.fetch_sub(1, atomic::Ordering::Relaxed);
-
-                        // it is safe to construct and later drop the Arc because for every
-                        // submission request we will get exactely one event here
-                        // this would break and produce undefined behaviour fore some opcodes!
-                        let data = unsafe { Arc::from_raw(event.user_data() as *mut Mutex<CompletionKind>) };
-                        let mut guard = data.lock().expect("data lock poisoned");
-                        match &mut *guard {
-                            CompletionKind::Regular { waker, result } => {
-                                *result = Some(event.result());
-                                if let Some(waker) = waker.take() { waker.wake() };
-                            },
-                            CompletionKind::WithError { .. } => (),
-                            CompletionKind::ExitNotification => exit = true
-                        }
-
-                        drop(guard);
-                        // the completion's data will also be dropped and cleaned up here
-                    }
-                    exit
-                });
-                if exit { break }
-            }
-        });
-
-        Ok(Self {
-            shared,
-            reaper: Some(reaper),
-        })
-
-    }
-
-    fn submit<'b, T>(&self, entry: io_uring::squeue::Entry, kind: CompletionKind, func: fn(i32) -> T) -> Completion<'b, T> {
-
-        let mut state = Arc::new(Mutex::new(kind));
-        let prepared = entry.user_data(Arc::into_raw(Arc::clone(&state)) as u64);
-
-        let result = self.shared.with_submission(|mut submission| {
-            // SAFETY: `op` will be valid
-            unsafe { submission.push(&prepared) }
-        });
-        if let Err(err) = result {
-            // make sure to cleanup the completion's data
-            unsafe { Arc::from_raw(prepared.get_user_data() as *mut Arc<Mutex<CompletionKind>>) };
-            state = Arc::new(Mutex::new(CompletionKind::with_error(io::Error::new(io::ErrorKind::Other, err))));
-        }
-
-        self.shared.in_flight.fetch_add(1, atomic::Ordering::Relaxed);
-        let result = self.shared.submitter().submit();
-        if let Err(err) = result {
-            // make sure to cleanup the completion's data
-            unsafe { Arc::from_raw(prepared.get_user_data() as *mut Arc<Mutex<CompletionKind>>) };
-            state = Arc::new(Mutex::new(CompletionKind::with_error(err)));
-        }
-
-        Completion {
-            state,
-            is_done: CompletionIsDone::NotDone,
-            func,
-            marker: PhantomData
-        }
-
-    }
-
-    /// Opens a file. Returns a [`File`].
-    ///
-    /// Opening files can sometimes block if they need to be created, emptied or more. This
-    /// function allows doing this in an asynchronous manner.
-    /// For more notes see [`OpenOptions`].
-    ///
-    /// # Safety
-    /// You must ensure that the returned `Completion` is never dropped without it's destructor
-    /// running.
-    pub unsafe fn open<'b, P: AsRef<path::Path> + 'b>(&self, path: P, options: OpenOptions) -> Completion<'b, File> {
-        let op = io_uring::opcode::OpenAt::new(
-            CWD,
-            path.as_ref().as_os_str().as_bytes().as_ptr() as *const i8
-        ).flags(options.flags).build();
-        self.submit(op, CompletionKind::regular(), |fd| {
-            assert!(fd > 0);
-            unsafe { File::from_raw_fd(fd) }
-        })
-    }
-
-    /// Reads data from a file at an offset. Returns how many bytes were read.
-    ///
-    /// If you wanna safely read a whole file you should use
-    /// - [`read_all`](IoUring::read_all)
-    /// - [`read_to_string`](IoUring::read_to_string)
-    ///
-    /// # Safety
-    /// You must ensure that the returned `Completion` is never dropped without it's destructor
-    /// running.
-    pub unsafe fn read_at<'b>(&self, file: &File, buf: &'b mut [u8], offset: u64) -> Completion<'b, usize> {
-        let op = io_uring::opcode::Read::new(
-            io_uring::types::Fd(file.as_raw_fd()),
-            buf.as_mut_ptr(),
-            buf.len() as u32
-        ).offset(offset).build();
-        self.submit(op, CompletionKind::regular(), |val| val as usize)
-    }
-
-    /// Reads the whole file.
-    pub async fn read_all<'b>(&self, file: &File) -> io::Result<Vec<u8>> {
-
-        let mut buf = Vec::new();
-        let mut to_read = 1024;
-        let mut total_bytes_read = 0;
-        loop {
-            let len = buf.len();
-            buf.resize(len + to_read, 0);
-            let bytes_read = unsafe { self.read_at(&file, &mut buf[len..len + to_read], total_bytes_read as u64) }.await?;
-            buf.truncate(len + bytes_read);
-            to_read *= 2;
-            total_bytes_read += bytes_read;
-            if bytes_read == 0 { break }
-        }
-
-        Ok(buf)
-
-    }
-
-    /// Reads the whole file as a string.
-    ///
-    /// Returns error if the file was not valid utf8.
-    /// You can check for it using the [`is_not_utf8`] function.
-    pub async fn read_to_string<'b>(&self, file: &File) -> io::Result<String> {
-
-        let buf = self.read_all(file).await?;
-        String::from_utf8(buf).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-
-    }
-
-    /// Writes data to a file at an offset. Returns how many bytes were written.
-    ///
-    /// # Safety
-    /// You must ensure that the returned `Completion` is never dropped without it's destructor
-    /// running.
-    pub unsafe fn write_at<'b>(&self, file: &File, buf: &'b [u8], offset: u64) -> Completion<'b, usize> {
-        let op = io_uring::opcode::Write::new(
-            io_uring::types::Fd(file.as_raw_fd()),
-            buf.as_ptr(),
-            buf.len() as u32
-        ).offset(offset).build();
-        self.submit(op, CompletionKind::regular(), |val| val as usize)
-    }
-
-    /// Writes all data to a file.
-    pub async fn write_all<'b>(&self, file: &File, mut buf: &'b [u8]) -> io::Result<()> {
-        let mut total_bytes_written = 0;
-        loop {
-            let bytes_written = unsafe { self.write_at(&file, buf, total_bytes_written as u64) }.await?;
-            total_bytes_written += bytes_written;
-            buf = &buf[bytes_written..];
-            if buf.len() == 0 { break }
-        }
-        Ok(())
-    }
-
-    /// Stats a file.
-    ///
-    /// # Safety
-    /// You must ensure that the returned future is never dropped without it's destructor
-    /// running.
-    pub async unsafe fn stat<'b, P: AsRef<path::Path> + 'b>(&self, path: P) -> io::Result<Stat> {
-        let mut statx: mem::MaybeUninit<libc::statx> = mem::MaybeUninit::uninit();
-        let op = io_uring::opcode::Statx::new(
-            CWD,
-            path.as_ref().as_os_str().as_bytes().as_ptr() as *const i8,
-            statx.as_mut_ptr() as *mut io_uring::types::statx,
-        ).build();
-        self.submit(op, CompletionKind::regular(), |_| ()).await?;
-        Ok(Stat::new(unsafe { statx.assume_init() }))
-    }
-
-    fn kill_reaper(&self) {
-
-        let op = io_uring::opcode::Timeout::new(
-            &io_uring::types::Timespec::from(time::Duration::ZERO)
-        ).build();
-
-        let mut completion = self.submit(op, CompletionKind::exit_notification(), |_| unreachable!());
-        completion.is_done = CompletionIsDone::ExitNotification; // to make the check on drop happy
-
-    }
-
-    /// How many I/O operations are currently being processed.
-    pub fn in_flight(&self) -> usize {
-        self.shared.in_flight.load(atomic::Ordering::Relaxed)
-    }
-    
+    shared: Arc<IoUringState>,
+    reaper: Option<thread::JoinHandle<()>>
 }
 
 impl Drop for IoUring {
+    /// On drop: Shut down the reaper thread, blocking for pending operations to complete and free their memory.
     fn drop(&mut self) {
-        self.kill_reaper();
+        self.shutdown().unwrap();
         self.reaper.take().unwrap().join().unwrap();
     }
 }
 
-/// Determines if this [`io::Error`] signals that the io-uring submission queue is full.
-///
-/// This is a possible error returned by any function that queues a new IO operation.
-///
-/// # Example
-/// ```ignore
-/// match unsafe { io.read_at(&file, &mut buf, 0) }.await {
-///     Ok(..) => (),
-///     Err(ref err) if is_queue_full(err) => ...,
-///     Err(other) => ...,
-/// };
-/// ```
-pub fn is_queue_full(error: &io::Error) -> bool {
-    error.get_ref().map(|inner| inner.downcast_ref::<io_uring::squeue::PushError>().is_some()).unwrap_or(false)
+struct IoUringState {
+    pub io_uring: io_uring::IoUring,
+    pub sq_lock: Mutex<()>,
+    pub in_flight: AtomicUsize,
 }
 
-/// Determines if this [`io::Error`] signals that the io-uring submission queue is full.
-///
-/// This is a possible error returned by [`IoUring::read_to_string`].
-pub fn is_not_utf8(error: &io::Error) -> bool {
-    error.get_ref().map(|inner| inner.downcast_ref::<std::string::FromUtf8Error>().is_some()).unwrap_or(false)
+struct Completion {
+    shared: Arc<CompletionState>,
 }
 
-#[cfg(test)]
-mod tests {
+struct CompletionState {
+    inner: Mutex<CompletionInner>, // needs a lock, because it will be accessed by the reaper thread
+    data: CompletionData // extra stuff that needs to be destroyed at completion
+}
 
-    #[test]
-    fn read() {
+enum CompletionData {
+    Path(Box<[u8]>),
+    Stat(StatCompletionData),
+    Buffer(UnsafeCell<Vec<u8>>),
+    ReadOnlyBuffer(Vec<u8>)
+}
 
-        extreme::run(async {
+impl CompletionData {
+    pub fn as_path(&self) -> &Box<[u8]> {
+        if let Self::Path(val) = self { val }
+        else { unreachable!() }
+    }
+    pub fn as_stat(&self) -> &StatCompletionData {
+        if let Self::Stat(val) = self { val }
+        else { unreachable!() }
+    }
+    pub fn into_stat(self) -> StatCompletionData {
+        if let Self::Stat(val) = self { val }
+        else { unreachable!() }
+    }
+    pub fn as_buffer(&self) -> &UnsafeCell<Vec<u8>> {
+        if let Self::Buffer(val) = self { val }
+        else { unreachable!() }
+    }
+    pub fn into_buffer(self) -> UnsafeCell<Vec<u8>> {
+        if let Self::Buffer(val) = self { val }
+        else { unreachable!() }
+    }
+    pub fn as_read_only_buffer(&self) -> &Vec<u8> {
+        if let Self::ReadOnlyBuffer(val) = self { val }
+        else { unreachable!() }
+    }
+}
 
-            let io = crate::IoUring::new().unwrap();
+struct StatCompletionData {
+    pub path: Box<[u8]>,
+    pub statx: UnsafeCell<libc::statx>
+}
 
-            let file = unsafe { io.open("src/foo.txt", crate::OpenOptions::RDWR) }.await.unwrap(); // todo: absolute path doesnt work!!! also: copy the path string so this can be safe
+struct CompletionInner {
+    pub waker: Option<Waker>,
+    pub result: Option<i32>,
+}
 
-            let info = unsafe { io.stat("src/foo.txt") }.await.unwrap();
-            println!("File size: {}", info.size());
+/// Like OpenOptions. Use libc or the associated constants.
+///
+/// Std `OpenOpentions` sadly doesn't provide any way of getting the libc flags out of it.
+/// At least I don't know of any way.
+pub struct Flags {
+    pub inner: i32
+}
 
-            let buf = io.read_all(&file).await.unwrap();
-            let bytes_read = buf.len();
-            println!("Bytes read: {}", bytes_read);
+impl Flags {
+    pub const RDONLY: Self = Self { inner: libc::O_RDONLY };
+    pub const WRONLY: Self = Self { inner: libc::O_WRONLY };
+    pub const RDWR:   Self = Self { inner: libc::O_RDWR };
+}
 
-            let bytes_written = unsafe { io.write_at(&file, &buf, 0) }.await.unwrap();
-            println!("Bytes written: {}", bytes_written);
+/// Result of a `stat` operation. Information about a file.
+///
+/// The raw result is provided as the `raw` field. Use it for more info.
+pub struct Stat {
+    pub raw: libc::statx,
+}
 
-            io.write_all(&file, b"Hello world, this is awesome!").await.unwrap();
+impl Stat {
+    /// The size of the file in bytes.
+    pub fn size(&self) -> u32 {
+        self.raw.stx_size as u32
+    }
+}
 
-            assert!(bytes_read > 0);
-            assert!(bytes_read == info.size() as usize);
-            assert!(bytes_read == bytes_written);
+fn io_uring_fd(fd: RawFd) -> io_uring::types::Fd {
+    io_uring::types::Fd(fd)
+}
 
+impl IoUring {
+
+    /// Create a new `io-uring` context.
+    ///
+    /// Will spawn a reaper thread.
+    pub fn new() -> io::Result<Self> {
+
+        let shared = Arc::new(IoUringState {
+            io_uring: io_uring::IoUring::new(4)?,
+            sq_lock: Mutex::new(()),
+            in_flight: AtomicUsize::new(0)
         });
+
+        let shared_clone = Arc::clone(&shared);
+
+        Ok(Self {
+            shared,
+            reaper: Some(thread::spawn(move || {
+
+                let mut should_exit = false;
+
+                loop {
+
+                    shared_clone.io_uring.submit_and_wait(1).unwrap();
+
+                    // we don't need locking here since the cq is only accessed right here
+                    let cq = unsafe { shared_clone.io_uring.completion_shared() };
+
+                    for entry in cq {
+
+                        if entry.user_data() == 0 {
+                            should_exit = true;
+                            continue;
+                        }
+
+                        let user_data = unsafe { Arc::from_raw(entry.user_data() as *mut CompletionState) };
+                        let mut guard = user_data.inner.lock().unwrap();
+
+                        guard.result = Some(entry.result());
+                        let waker = guard.waker.take();
+                        // it is important to drop the user data before waking up the future, so that the other side has exclusive ownership of the Arc
+                        drop(guard);
+                        drop(user_data);
+
+                        if shared_clone.in_flight.fetch_sub(1, Ordering::Relaxed) == 0 {
+                            shared_clone.in_flight.fetch_add(1, Ordering::Relaxed); // cancel out the wrap-around
+                        };
+
+                        if let Some(waker) = waker {
+                            waker.wake();
+                        }
+
+                    }
+
+                    // make sure all io requests are finished
+                    if should_exit && shared_clone.in_flight.load(Ordering::Relaxed) == 0 {
+                        return
+                    }
+
+                }
+            }))
+        })
+
+    }
+
+    /// Open a file.
+    ///
+    /// You can also open it using std. See [`Fd`] docs.
+    pub async fn open<P: AsRef<Path>>(&self, path: P, flags: Flags) -> io::Result<File> {
+
+        let data = Vec::from(
+            path.as_ref().as_os_str().as_encoded_bytes()
+        ).into_boxed_slice(); // will be kept alive until completion
+
+        let state = Arc::new(CompletionState {
+            inner: Mutex::new(CompletionInner {
+                waker: None,
+                result: None,
+            }),
+            data: CompletionData::Path(data)
+        });
+
+        let reaper_state = Arc::clone(&state);
+        let data_ref = state.data.as_path();
+        let entry = opcode::OpenAt::new(io_uring_fd(libc::AT_FDCWD), data_ref.as_ptr() as *const i8)
+            .flags(flags.inner)
+            .build()
+            .user_data(Arc::into_raw(reaper_state) as u64);
+        
+        let guard = self.shared.sq_lock.lock().unwrap();
+        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
+        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        sq.sync();
+        drop(guard);
+
+        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.shared.io_uring.submit()?;
+
+        let result = Completion {
+            shared: state,
+        }.await;
+
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result))
+        }
+
+        Ok(unsafe { File::from_raw_fd(result) })
+
+    }
+
+    /// Obtain information about a file.
+    pub async fn stat<P: AsRef<Path>>(&self, path: P) -> io::Result<Stat> {
+
+        let data = StatCompletionData {
+            path: Vec::from(path.as_ref().as_os_str().as_encoded_bytes()).into_boxed_slice(),
+            statx: UnsafeCell::new(unsafe { zeroed::<libc::statx>() })
+        }; // will be kept alive until completion
+
+        let state = Arc::new(CompletionState {
+            inner: Mutex::new(CompletionInner {
+                waker: None,
+                result: None,
+            }),
+            data: CompletionData::Stat(data)
+        });
+
+        let reaper_state = Arc::clone(&state);
+        let data_ref = state.data.as_stat();
+        let entry = opcode::Statx::new(io_uring_fd(libc::AT_FDCWD), data_ref.path.as_ptr() as *const i8, data_ref.statx.get() as *mut _)
+            .build()
+            .user_data(Arc::into_raw(reaper_state) as u64);
+        
+        let guard = self.shared.sq_lock.lock().unwrap();
+        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
+        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        sq.sync();
+        drop(guard);
+
+        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.shared.io_uring.submit()?;
+
+        let completion_state = Arc::clone(&state);
+        let result = Completion {
+            shared: completion_state,
+        }.await;
+
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result))
+        }
+
+        let exclusive_state = Arc::into_inner(state).unwrap();
+        let data = exclusive_state.data.into_stat();
+        Ok(Stat { raw: data.statx.into_inner() })
+
+    }
+
+    /// Read exactly `size` bytes from a file.
+    ///
+    /// **This will advance the internal file cursor.**
+    ///
+    /// This function returns a `Vec` so it can be used safely without
+    /// creating memory-leaks or use-after-free bugs.
+    pub async fn read(&self, fd: &File, size: u32) -> io::Result<Vec<u8>> {
+
+        let mut data = UnsafeCell::new(Vec::new());
+        data.get_mut().resize(size as usize, 0);
+
+        let state = Arc::new(CompletionState {
+            inner: Mutex::new(CompletionInner {
+                waker: None,
+                result: None,
+            }),
+            data:CompletionData::Buffer(data) 
+        });
+
+        let reaper_state = Arc::clone(&state);
+        let data_ref = state.data.as_buffer();
+        let entry = opcode::Read::new(io_uring_fd(fd.as_raw_fd()), unsafe { &mut *data_ref.get() }.as_mut_ptr() as *mut _, size as u32)
+            .offset(-1i64 as u64)
+            .build()
+            .user_data(Arc::into_raw(reaper_state) as u64);
+    
+        let guard = self.shared.sq_lock.lock().unwrap();
+        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
+        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        sq.sync();
+        drop(guard);
+
+        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.shared.io_uring.submit()?;
+
+        let completion_state = Arc::clone(&state);
+        let result = Completion {
+            shared: completion_state,
+        }.await;
+
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result))
+        }
+
+        let exclusive_state = Arc::into_inner(state).unwrap();
+        let mut data = exclusive_state.data.into_buffer().into_inner();
+        data.truncate(result as usize); // important because we might have read less bytes than requested
+        Ok(data)
+
+    }
+
+    /// Read the full file.
+    ///
+    /// **This will advance the internal file cursor.**
+    pub async fn read_all(&self, fd: &File) -> io::Result<Vec<u8>> {
+
+        let mut buffer = Vec::with_capacity(2048);
+        let mut chunk_size = 2048;
+
+        loop {
+            let some_data = self.read(fd, chunk_size).await?;
+            if some_data.is_empty() { break };
+            buffer.extend_from_slice(&some_data);
+            chunk_size *= 2;
+        }
+
+        Ok(buffer)
+        
+    }
+
+    /// Write all the data to the file. 
+    ///
+    /// **This will advance the internal file cursor.**
+    pub async fn write(&self, fd: &File, buffer: Vec<u8>) -> io::Result<()> {
+
+        let state = Arc::new(CompletionState {
+            inner: Mutex::new(CompletionInner {
+                waker: None,
+                result: None,
+            }),
+            data: CompletionData::ReadOnlyBuffer(buffer)
+        });
+
+        let reaper_state = Arc::clone(&state);
+        let data_ref = state.data.as_read_only_buffer();
+        let entry = opcode::Write::new(io_uring_fd(fd.as_raw_fd()), data_ref.as_ptr(), data_ref.len() as u32)
+            .offset(-1i64 as u64)
+            .build()
+            .user_data(Arc::into_raw(reaper_state) as u64);
+    
+        let guard = self.shared.sq_lock.lock().unwrap();
+        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
+        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        sq.sync();
+        drop(guard);
+
+        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.shared.io_uring.submit()?;
+
+        let completion_state = Arc::clone(&state);
+        let result = Completion {
+            shared: completion_state,
+        }.await;
+
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result))
+        }
+
+        Ok(())
+
+    }
+
+    /// Cancels all currently running I/O operations.
+    /// If the reaper thread is stopped, by dropping this struct,
+    /// this will potentially leak their memory and make their futures never complete.
+    pub fn cancel_all(&self) -> io::Result<()> {
+
+        self.shared.in_flight.store(0, Ordering::Relaxed);
+
+        Ok(())
+        
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+
+        let entry = opcode::Nop::new()
+            .build()
+            .user_data(0);
+    
+        let guard = self.shared.sq_lock.lock().unwrap();
+        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
+        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        sq.sync();
+        drop(guard);
+
+        // we don't increment the in_flight counter here on purpose
+        self.shared.io_uring.submit()?;
+
+        Ok(())
         
     }
 
 }
 
+impl Future for Completion {
+    type Output = i32;
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
+        let mut guard = self.shared.inner.lock().unwrap();
+        if let Some(result) = guard.result {
+            task::Poll::Ready(result)
+        } else {
+            guard.waker = Some(cx.waker().clone());
+            task::Poll::Pending
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn foo() {
+        extreme::run(async {
+            let io = crate::IoUring::new().unwrap();
+            let fd = io.open("src/foo.txt", crate::Flags::RDWR).await.unwrap();
+            let _stat = io.stat("src/foo.txt").await.unwrap();
+            let content = io.read_all(&fd).await.unwrap();
+            println!("{}", String::from_utf8_lossy(&content));
+        })
+    }
+}
