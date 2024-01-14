@@ -62,6 +62,8 @@ use io_uring::opcode;
 /// to complete first.
 /// If this waiting is an issue to you, you should call [`cancel_all`](IoUring::cancel_all) to cancel all operations.
 /// This will, however leak some memory for every active operation.
+///
+/// Note that some function are not marked as `async`, however they still return futures.
 pub struct IoUring {
     shared: Arc<IoUringState>,
     reaper: Option<thread::JoinHandle<()>>
@@ -96,6 +98,9 @@ enum CompletionData {
     Buffer(UnsafeCell<Vec<u8>>),
     ReadOnlyBuffer(Vec<u8>)
 }
+
+unsafe impl Send for CompletionData {}
+unsafe impl Sync for CompletionData {}
 
 impl CompletionData {
     pub fn as_path(&self) -> &Box<[u8]> {
@@ -234,7 +239,7 @@ impl IoUring {
     /// Open a file.
     ///
     /// You can also open it using std. See [`Fd`] docs.
-    pub async fn open<P: AsRef<Path>>(&self, path: P, flags: Flags) -> io::Result<File> {
+    pub fn open<P: AsRef<Path>>(&self, path: P, flags: Flags) -> impl Future<Output=io::Result<File>> {
 
         let data = Vec::from(
             path.as_ref().as_os_str().as_encoded_bytes()
@@ -257,27 +262,32 @@ impl IoUring {
         
         let guard = self.shared.sq_lock.lock().unwrap();
         let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        unsafe { sq.push(&entry).unwrap() };
         sq.sync();
         drop(guard);
 
         self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit()?;
+        self.shared.io_uring.submit().unwrap();
 
-        let result = Completion {
-            shared: state,
-        }.await;
+        async move {
+            
+            let result = Completion {
+                shared: state,
+            }.await;
 
-        if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result))
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result))
+            }
+
+            Ok(unsafe { File::from_raw_fd(result) })
+
         }
 
-        Ok(unsafe { File::from_raw_fd(result) })
 
     }
 
     /// Obtain information about a file.
-    pub async fn stat<P: AsRef<Path>>(&self, path: P) -> io::Result<Stat> {
+    pub fn stat<P: AsRef<Path>>(&self, path: P) -> impl Future<Output=io::Result<Stat>> {
 
         let data = StatCompletionData {
             path: Vec::from(path.as_ref().as_os_str().as_encoded_bytes()).into_boxed_slice(),
@@ -300,25 +310,29 @@ impl IoUring {
         
         let guard = self.shared.sq_lock.lock().unwrap();
         let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        unsafe { sq.push(&entry).unwrap() };
         sq.sync();
         drop(guard);
 
         self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit()?;
+        self.shared.io_uring.submit().unwrap();
 
-        let completion_state = Arc::clone(&state);
-        let result = Completion {
-            shared: completion_state,
-        }.await;
+        async move {
 
-        if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result))
+            let completion_state = Arc::clone(&state);
+            let result = Completion {
+                shared: completion_state,
+            }.await;
+
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result))
+            }
+
+            let exclusive_state = Arc::into_inner(state).unwrap();
+            let data = exclusive_state.data.into_stat();
+            Ok(Stat { raw: data.statx.into_inner() })
+            
         }
-
-        let exclusive_state = Arc::into_inner(state).unwrap();
-        let data = exclusive_state.data.into_stat();
-        Ok(Stat { raw: data.statx.into_inner() })
 
     }
 
@@ -328,7 +342,7 @@ impl IoUring {
     ///
     /// This function returns a `Vec` so it can be used safely without
     /// creating memory-leaks or use-after-free bugs.
-    pub async fn read(&self, fd: &File, size: u32) -> io::Result<Vec<u8>> {
+    pub fn read(&self, fd: &File, size: u32) -> impl Future<Output=io::Result<Vec<u8>>> {
 
         let mut data = UnsafeCell::new(Vec::new());
         data.get_mut().resize(size as usize, 0);
@@ -350,26 +364,30 @@ impl IoUring {
     
         let guard = self.shared.sq_lock.lock().unwrap();
         let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        unsafe { sq.push(&entry).unwrap() };
         sq.sync();
         drop(guard);
 
         self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit()?;
+        self.shared.io_uring.submit().unwrap();
 
-        let completion_state = Arc::clone(&state);
-        let result = Completion {
-            shared: completion_state,
-        }.await;
+        async move {
 
-        if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result))
+            let completion_state = Arc::clone(&state);
+            let result = Completion {
+                shared: completion_state,
+            }.await;
+
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result))
+            }
+
+            let exclusive_state = Arc::into_inner(state).unwrap();
+            let mut data = exclusive_state.data.into_buffer().into_inner();
+            data.truncate(result as usize); // important because we might have read less bytes than requested
+            Ok(data)
+
         }
-
-        let exclusive_state = Arc::into_inner(state).unwrap();
-        let mut data = exclusive_state.data.into_buffer().into_inner();
-        data.truncate(result as usize); // important because we might have read less bytes than requested
-        Ok(data)
 
     }
 
@@ -395,7 +413,7 @@ impl IoUring {
     /// Write all the data to the file. 
     ///
     /// **This will advance the internal file cursor.**
-    pub async fn write(&self, fd: &File, buffer: Vec<u8>) -> io::Result<()> {
+    pub fn write(&self, fd: &File, buffer: Vec<u8>) -> impl Future<Output=io::Result<()>> {
 
         let state = Arc::new(CompletionState {
             inner: Mutex::new(CompletionInner {
@@ -414,23 +432,27 @@ impl IoUring {
     
         let guard = self.shared.sq_lock.lock().unwrap();
         let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
+        unsafe { sq.push(&entry).unwrap() };
         sq.sync();
         drop(guard);
 
         self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit()?;
+        self.shared.io_uring.submit().unwrap();
 
-        let completion_state = Arc::clone(&state);
-        let result = Completion {
-            shared: completion_state,
-        }.await;
+        async move {
+            
+            let completion_state = Arc::clone(&state);
+            let result = Completion {
+                shared: completion_state,
+            }.await;
 
-        if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result))
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result))
+            }
+
+            Ok(())
+
         }
-
-        Ok(())
 
     }
 
@@ -483,12 +505,15 @@ impl Future for Completion {
 mod test {
     #[test]
     fn foo() {
-        extreme::run(async {
+        extreme::run(assert_send(async {
             let io = crate::IoUring::new().unwrap();
             let fd = io.open("src/foo.txt", crate::Flags::RDWR).await.unwrap();
             let _stat = io.stat("src/foo.txt").await.unwrap();
             let content = io.read_all(&fd).await.unwrap();
             println!("{}", String::from_utf8_lossy(&content));
-        })
+        }))
+    }
+    fn assert_send<T: Send>(t: T) -> T {
+        t
     }
 }
