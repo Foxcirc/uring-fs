@@ -16,16 +16,16 @@
 //! # fn main() -> io::Result<()> {
 //! # extreme::run(async{
 //! let io = IoUring::new()?; // create a new io-uring context
-//! let mut file: fs::File = io.open("src/foo.txt", Flags::RDONLY).await?;
+//! let mut file: fs::File = io.open("src/file.txt", Flags::RDONLY).await?;
 //! //            ^^^^ you could also use File::open or OpenOptions
-//! let info = io.stat("src/foo.txt").await?;
+//! let info = io.stat("src/file.txt").await?;
 //! // there is also read_all, which doesn't require querying the file size
 //! // using stat, however this is a bit more efficient since we only allocate the data buffer once
 //! let content = io.read(&file, info.size()).await?;
 //! println!("we read {} bytes", content.len());
 //! // btw you can also seek the file using io::Seek
 //! file.seek(SeekFrom::Current(-10));
-//! Ok(())
+//! # Ok(())
 //! # })
 //! # }
 //!```
@@ -33,14 +33,6 @@
 //! # Notes
 //! This library will spawn a reaper thread that waits for io-uring completions and notifies the apropriate future.
 //! Still, this is light weight in comparison to using a thread pool.
-//!
-//! This crate doesn't have the same soundness problems as `rio`, however it isn't as powerfull.
-//! If you want to use `rio`, remember to, at some point, enable the `no_metrics` feature!
-//! Otherwise there will be a ~100ms initial allocation of space used to store the performance metrics.
-//!
-//! Please also note that the code for this library is not tested very well and might
-//! contain some subtle undefined behaviour. This library is kept small and hackable so
-//! you can always verify and fork it yourself.
 
 use std::{
     path::Path,
@@ -63,7 +55,12 @@ use io_uring::opcode;
 /// If this waiting is an issue to you, you should call [`cancel_all`](IoUring::cancel_all) to cancel all operations.
 /// This will, however leak some memory for every active operation.
 ///
-/// Note that some function are not marked as `async`, however they still return futures.
+/// Every function that interacts with `io-uring` will panic if that interaction fails. Only errors for *your*
+/// operation will be returned inside the output of the future.
+/// In theory you can check for `io-uring` support using a [`Probe`](https://docs.rs/io-uring/latest/io_uring/register/struct.Probe.html.).
+
+/// # Note
+/// Some function aren't marked as `async`, however they still return futures.
 pub struct IoUring {
     shared: Arc<IoUringState>,
     reaper: Option<thread::JoinHandle<()>>
@@ -99,7 +96,6 @@ enum CompletionData {
     ReadOnlyBuffer(Vec<u8>)
 }
 
-unsafe impl Send for CompletionData {}
 unsafe impl Sync for CompletionData {}
 
 impl CompletionData {
@@ -201,6 +197,10 @@ impl IoUring {
 
                     for entry in cq {
 
+                        if shared_clone.in_flight.fetch_sub(1, Ordering::Relaxed) == 0 {
+                            shared_clone.in_flight.store(0, Ordering::Relaxed); // cancel out the wrap-around: set it back to 0
+                        };
+
                         if entry.user_data() == 0 {
                             should_exit = true;
                             continue;
@@ -215,14 +215,9 @@ impl IoUring {
                         drop(guard);
                         drop(user_data);
 
-                        if shared_clone.in_flight.fetch_sub(1, Ordering::Relaxed) == 0 {
-                            shared_clone.in_flight.fetch_add(1, Ordering::Relaxed); // cancel out the wrap-around
-                        };
-
                         if let Some(waker) = waker {
                             waker.wake();
                         }
-
                     }
 
                     // make sure all io requests are finished
@@ -259,18 +254,11 @@ impl IoUring {
             .flags(flags.inner)
             .build()
             .user_data(Arc::into_raw(reaper_state) as u64);
-        
-        let guard = self.shared.sq_lock.lock().unwrap();
-        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).unwrap() };
-        sq.sync();
-        drop(guard);
 
-        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit().unwrap();
+        self.push_and_submit(entry);
 
         async move {
-            
+
             let result = Completion {
                 shared: state,
             }.await;
@@ -307,16 +295,9 @@ impl IoUring {
         let entry = opcode::Statx::new(io_uring_fd(libc::AT_FDCWD), data_ref.path.as_ptr() as *const i8, data_ref.statx.get() as *mut _)
             .build()
             .user_data(Arc::into_raw(reaper_state) as u64);
+
+        self.push_and_submit(entry);
         
-        let guard = self.shared.sq_lock.lock().unwrap();
-        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).unwrap() };
-        sq.sync();
-        drop(guard);
-
-        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit().unwrap();
-
         async move {
 
             let completion_state = Arc::clone(&state);
@@ -352,7 +333,7 @@ impl IoUring {
                 waker: None,
                 result: None,
             }),
-            data:CompletionData::Buffer(data) 
+            data: CompletionData::Buffer(data) 
         });
 
         let reaper_state = Arc::clone(&state);
@@ -361,15 +342,8 @@ impl IoUring {
             .offset(-1i64 as u64)
             .build()
             .user_data(Arc::into_raw(reaper_state) as u64);
-    
-        let guard = self.shared.sq_lock.lock().unwrap();
-        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).unwrap() };
-        sq.sync();
-        drop(guard);
 
-        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit().unwrap();
+        self.push_and_submit(entry);
 
         async move {
 
@@ -383,7 +357,7 @@ impl IoUring {
             }
 
             let exclusive_state = Arc::into_inner(state).unwrap();
-            let mut data = exclusive_state.data.into_buffer().into_inner();
+            let mut data = exclusive_state.data.into_buffer().into_inner(); // there will be no other references to this at this point
             data.truncate(result as usize); // important because we might have read less bytes than requested
             Ok(data)
 
@@ -429,21 +403,13 @@ impl IoUring {
             .offset(-1i64 as u64)
             .build()
             .user_data(Arc::into_raw(reaper_state) as u64);
-    
-        let guard = self.shared.sq_lock.lock().unwrap();
-        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).unwrap() };
-        sq.sync();
-        drop(guard);
 
-        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.shared.io_uring.submit().unwrap();
+        self.push_and_submit(entry);
 
         async move {
             
-            let completion_state = Arc::clone(&state);
             let result = Completion {
-                shared: completion_state,
+                shared: state
             }.await;
 
             if result < 0 {
@@ -456,8 +422,9 @@ impl IoUring {
 
     }
 
-    /// Cancels all currently running I/O operations.
-    /// If the reaper thread is stopped, by dropping this struct,
+    /// Soft-cancels all currently running I/O operations.
+    /// 
+    /// This means, that if the reaper thread is stopped (by dropping this struct),
     /// this will potentially leak their memory and make their futures never complete.
     pub fn cancel_all(&self) -> io::Result<()> {
 
@@ -467,20 +434,32 @@ impl IoUring {
         
     }
 
+    fn push_and_submit(&self, entry: io_uring::squeue::Entry) {
+        
+        let guard = self.shared.sq_lock.lock().unwrap();
+        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
+
+        unsafe { sq.push(&entry).unwrap() };
+
+        sq.sync();
+
+        assert!(sq.len() == 1);
+
+        self.shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.shared.io_uring.submit().unwrap();
+
+        drop(sq); // <- sq and guard MUST BE dropped together in this order
+        drop(guard);
+
+    }
+
     fn shutdown(&self) -> io::Result<()> {
 
         let entry = opcode::Nop::new()
             .build()
             .user_data(0);
     
-        let guard = self.shared.sq_lock.lock().unwrap();
-        let mut sq = unsafe { self.shared.io_uring.submission_shared() };
-        unsafe { sq.push(&entry).map_err(|err| io::Error::other(err))? };
-        sq.sync();
-        drop(guard);
-
-        // we don't increment the in_flight counter here on purpose
-        self.shared.io_uring.submit()?;
+        self.push_and_submit(entry);
 
         Ok(())
         
@@ -507,8 +486,9 @@ mod test {
     fn foo() {
         extreme::run(assert_send(async {
             let io = crate::IoUring::new().unwrap();
-            let fd = io.open("src/foo.txt", crate::Flags::RDWR).await.unwrap();
-            let _stat = io.stat("src/foo.txt").await.unwrap();
+            std::env::set_current_dir("src").unwrap();
+            let fd = io.open("file.txt", crate::Flags::RDWR).await.unwrap();
+            let _stat = io.stat("file.txt").await.unwrap();
             let content = io.read_all(&fd).await.unwrap();
             println!("{}", String::from_utf8_lossy(&content));
         }))
